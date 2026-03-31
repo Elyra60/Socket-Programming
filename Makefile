@@ -31,7 +31,10 @@ $(SRC_DIR)/y.tab.c: $(SRC_DIR)/parser.y
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(OBJ_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-echo_server: $(OBJ_DIR)/echo_server.o
+.PHONY: rebuild
+rebuild: clean all
+
+echo_server: $(OBJ_DIR)/echo_server.o $(OBJ_DIR)/parse.o $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o
 	$(CC) -Werror $^ -o $@
 
 echo_client: $(OBJ_DIR)/echo_client.o

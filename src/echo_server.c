@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <string.h>
+#include "parse.h"
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
 
@@ -94,19 +95,78 @@ int main(int argc, char *argv[]) {
         }
         fprintf(stdout,"New connection from %s:%d\n",inet_ntoa(cli_addr.sin_addr),ntohs(cli_addr.sin_port));
         while(1){
-             /* receive msg from client, and concatenate msg with "(echo back)" to send back */
+            /* receive HTTP request from client */
             memset(buf, 0, BUF_SIZE);
             int readret = recv(client_sock, buf, BUF_SIZE, 0);
-            if (readret <0)break;
-            fprintf(stdout,"Received (total %d bytes):%s \n",readret,buf); 
-            strcat(buf,"(echo back)");
-            if(send(client_sock, buf, strlen(buf), 0) < 0)break;
-            fprintf(stdout,"Send back\n");
-            /* when client is closing the connection：
-                FIN of client carrys empty，so recv() return 0
-                ACK of server only carrys"(echo back)", so send() return 11
-                ACK of client carrys empty, so recv() return 0
-                Then server finishes closing the connection, recv() and send() return -1 */
+            if (readret <= 0) {
+                break;
+            }
+
+            fprintf(stdout,"Received (total %d bytes):\n%.*s\n", readret, readret, buf);
+
+            /* parse HTTP request */
+            Request *request = parse(buf, readret, client_sock);
+
+            if (request == NULL) {
+                /* format error */
+                const char *bad_req = "HTTP/1.1 400 Bad request\r\n\r\n";
+                send(client_sock, bad_req, strlen(bad_req), 0);
+                fprintf(stdout, "Sent 400 Bad request\n");
+                break;
+            }
+
+            /* check HTTP method */
+            int is_supported =
+                strcmp(request->http_method, "GET") == 0 ||
+                strcmp(request->http_method, "HEAD") == 0 ||
+                strcmp(request->http_method, "POST") == 0;
+
+            if (!is_supported) {
+                const char *not_impl = "HTTP/1.1 501 Not Implemented\r\n\r\n";
+                send(client_sock, not_impl, strlen(not_impl), 0);
+                fprintf(stdout, "Sent 501 Not Implemented for method %s\n", request->http_method);
+                free(request->headers);
+                free(request);
+                break;
+            }
+
+            /* supported methods: echo back the original message in the body */
+            char response[BUF_SIZE * 2];
+            int body_len = readret;
+
+            int header_len = snprintf(
+                response,
+                sizeof(response),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: %d\r\n"
+                "Content-Type: text/plain\r\n"
+                "\r\n",
+                body_len
+            );
+
+            if (header_len < 0 || header_len >= (int)sizeof(response)) {
+                free(request->headers);
+                free(request);
+                break;
+            }
+
+            if (header_len + body_len > (int)sizeof(response)) {
+                body_len = (int)sizeof(response) - header_len;
+            }
+
+            memcpy(response + header_len, buf, body_len);
+
+            int total_len = header_len + body_len;
+            if (send(client_sock, response, total_len, 0) < 0) {
+                free(request->headers);
+                free(request);
+                break;
+            }
+
+            fprintf(stdout,"Echoed HTTP request back to client\n");
+
+            free(request->headers);
+            free(request);
         }
         /* client closes the connection. server free resources and listen again */
         if (close_socket(client_sock))
