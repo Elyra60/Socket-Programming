@@ -1,2 +1,60 @@
 [Mon Apr 20 08:36:21 2026] [notice] liso_server started on port 9999
 [Mon Apr 20 08:43:13 2026] [error] file access failed for static_site/this_file_does_not_exist.html: status=404 errno=No such file or directory
+[Mon May 04 05:45:56 2026] [notice] liso_server started on port 9999
+[Mon May 04 05:46:13 2026] [error] file access failed for static_site/missing.html: errno=No such file or directory
+[Mon May 04 05:46:13 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 05:46:59 2026] [notice] received signal 15, shutting down
+[Mon May 04 05:47:41 2026] [notice] liso_server started on port 9999
+[Mon May 04 05:47:58 2026] [error] file access failed for static_site/missing.html: errno=No such file or directory
+[Mon May 04 05:47:58 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 05:48:13 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:00:04 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:00:23 2026] [error] file access failed for static_site/missing.html: errno=No such file or directory
+[Mon May 04 06:00:23 2026] [error] file access failed for static_site/missing.html: errno=No such file or directory
+[Mon May 04 06:02:31 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:02:38 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:02:56 2026] [error] file access failed for static_site/missing.html: errno=No such file or directory
+[Mon May 04 06:02:56 2026] [error] file access failed for static_site/missing.html: errno=No such file or directory
+[Mon May 04 06:03:02 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:03:40 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:03:50 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:04:00 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:09:53 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:10:07 2026] [error] file access failed for static_site/~prs/15-441-F15/: errno=No such file or directory
+[Mon May 04 06:10:07 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:10:47 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:22:33 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:22:47 2026] [error] file access failed for static_site/~prs/15-441-F15/: errno=No such file or directory
+[Mon May 04 06:22:47 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:23:33 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:33:48 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:34:04 2026] [error] file access failed for static_site/~prs/15-441-F15/: errno=No such file or directory
+[Mon May 04 06:34:04 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:34:33 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:36:36 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:37:17 2026] [error] file access failed for static_site/~prs/15-441-F15/: errno=No such file or directory
+[Mon May 04 06:37:17 2026] [error] file access failed for static_site/missing1: errno=No such file or directory
+[Mon May 04 06:37:17 2026] [error] file access failed for static_site/missing2: errno=No such file or directory
+[Mon May 04 06:37:17 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:37:43 2026] [notice] received signal 15, shutting down
+[Mon May 04 06:59:29 2026] [notice] liso_server started on port 9999
+[Mon May 04 06:59:46 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:59:46 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:59:46 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:59:46 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 06:59:46 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:00:00 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:00:00 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:00:00 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:00:00 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:01:54 2026] [notice] received signal 15, shutting down
+[Mon May 04 07:02:11 2026] [notice] liso_server started on port 9999
+[Mon May 04 07:02:27 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:02:27 2026] [error] file access failed for static_site/~prs/15-441-F15/: errno=No such file or directory
+[Mon May 04 07:02:27 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:05:20 2026] [notice] received signal 15, shutting down
+[Mon May 04 07:05:53 2026] [notice] liso_server started on port 9999
+[Mon May 04 07:06:14 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:06:14 2026] [error] file access failed for static_site/~prs/15-441-F15/: errno=No such file or directory
+[Mon May 04 07:06:14 2026] [error] parse failed from 172.17.0.1
+[Mon May 04 07:06:20 2026] [notice] received signal 15, shutting down

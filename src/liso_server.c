@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -17,7 +18,13 @@
 
 #define LISO_PORT 9999
 #define RECV_CHUNK 4096
+#define MAX_HEADER_SIZE 8192
 #define MAX_REQUEST_SIZE (1024 * 1024)
+
+#define RESPONSE_400 "HTTP/1.1 400 Bad request\r\n\r\n"
+#define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
+#define RESPONSE_501 "HTTP/1.1 501 Not Implemented\r\n\r\n"
+#define RESPONSE_505 "HTTP/1.1 505 HTTP Version not supported\r\n\r\n"
 
 static int listen_sock = -1;
 
@@ -62,6 +69,8 @@ static const char *status_text(int status)
         return "Internal Server Error";
     case 501:
         return "Not Implemented";
+    case 505:
+        return "HTTP Version not supported";
     default:
         return "Internal Server Error";
     }
@@ -115,6 +124,31 @@ static int send_all(int fd, const void *buf, size_t len)
         sent += (size_t)n;
     }
     return 0;
+}
+
+static int send_simple_error(int fd, int status)
+{
+    const char *response;
+
+    switch (status) {
+    case 400:
+        response = RESPONSE_400;
+        break;
+    case 404:
+        response = RESPONSE_404;
+        break;
+    case 501:
+        response = RESPONSE_501;
+        break;
+    case 505:
+        response = RESPONSE_505;
+        break;
+    default:
+        response = RESPONSE_400;
+        break;
+    }
+
+    return send_all(fd, response, strlen(response));
 }
 
 static int send_response(
@@ -182,6 +216,17 @@ static const char *request_get_header(const Request *req, const char *name)
     return NULL;
 }
 
+static bool only_crlf_bytes(const char *buf, size_t len)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        if (buf[i] != '\r' && buf[i] != '\n') {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool request_should_keep_alive(const Request *req)
 {
     bool keep_alive = (strcmp(req->http_version, "HTTP/1.1") == 0);
@@ -196,17 +241,29 @@ static bool request_should_keep_alive(const Request *req)
     return keep_alive;
 }
 
+static bool request_version_supported(const Request *req)
+{
+    return strcmp(req->http_version, "HTTP/1.1") == 0;
+}
+
+static bool request_method_implemented(const Request *req)
+{
+    return strcmp(req->http_method, "GET") == 0 ||
+           strcmp(req->http_method, "HEAD") == 0 ||
+           strcmp(req->http_method, "POST") == 0;
+}
+
 static int request_content_length(const Request *req)
 {
     char *endptr;
     long value;
     const char *header_value = request_get_header(req, "Content-Length");
     if (header_value == NULL) {
-        return -1;
+        return 0;
     }
     errno = 0;
     value = strtol(header_value, &endptr, 10);
-    if (errno != 0 || endptr == header_value || *endptr != '\0' || value < 0 || value > MAX_REQUEST_SIZE) {
+    if (errno != 0 || endptr == header_value || *endptr != '\0' || value < 0 || value > INT_MAX) {
         return -1;
     }
     return (int)value;
@@ -215,14 +272,29 @@ static int request_content_length(const Request *req)
 static int resolve_path(const char *uri, char *out, size_t out_size)
 {
     const char *mapped_uri = uri;
+    char clean_uri[4096];
+    const char *query;
+    size_t clean_len;
+
     if (uri == NULL || uri[0] != '/') {
         return -1;
     }
     if (strstr(uri, "..") != NULL) {
         return -1;
     }
-    if (strcmp(uri, "/") == 0) {
+
+    query = strchr(uri, '?');
+    clean_len = (query != NULL) ? (size_t)(query - uri) : strlen(uri);
+    if (clean_len == 0 || clean_len >= sizeof(clean_uri)) {
+        return -1;
+    }
+    memcpy(clean_uri, uri, clean_len);
+    clean_uri[clean_len] = '\0';
+
+    if (strcmp(clean_uri, "/") == 0) {
         mapped_uri = "/index.html";
+    } else {
+        mapped_uri = clean_uri;
     }
     if (snprintf(out, out_size, "static_site%s", mapped_uri) >= (int)out_size) {
         return -1;
@@ -243,26 +315,20 @@ static int load_file(const char *path, char **data, size_t *size)
 
     fd = open(path, O_RDONLY);
     if (fd < 0) {
-        if (errno == ENOENT) {
-            return 404;
-        }
-        if (errno == EACCES) {
-            return 403;
-        }
-        return 500;
+        return 404;
     }
     if (fstat(fd, &st) != 0) {
         close(fd);
-        return 500;
+        return 404;
     }
     if (S_ISDIR(st.st_mode)) {
         close(fd);
-        return 403;
+        return 404;
     }
 
     if (st.st_size < 0 || st.st_size > MAX_REQUEST_SIZE) {
         close(fd);
-        return 500;
+        return 404;
     }
 
     *size = (size_t)st.st_size;
@@ -274,7 +340,7 @@ static int load_file(const char *path, char **data, size_t *size)
     buf = (char *)malloc(*size);
     if (buf == NULL) {
         close(fd);
-        return 500;
+        return 404;
     }
 
     while (off < *size) {
@@ -285,7 +351,7 @@ static int load_file(const char *path, char **data, size_t *size)
             }
             free(buf);
             close(fd);
-            return 500;
+            return 404;
         }
         if (n == 0) {
             break;
@@ -312,8 +378,8 @@ static int handle_request(
     int client_fd,
     const char *client_ip,
     const Request *request,
-    const char *body,
-    size_t body_len,
+    const char *raw_request,
+    size_t raw_request_len,
     bool *keep_alive_out,
     size_t *bytes_out
 )
@@ -324,6 +390,26 @@ static int handle_request(
     *keep_alive_out = keep_alive;
     *bytes_out = 0;
 
+    if (!request_version_supported(request)) {
+        status = 505;
+        *keep_alive_out = false;
+        if (send_simple_error(client_fd, status) != 0) {
+            return -1;
+        }
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, 0);
+        return status;
+    }
+
+    if (!request_method_implemented(request)) {
+        status = 501;
+        *keep_alive_out = false;
+        if (send_simple_error(client_fd, status) != 0) {
+            return -1;
+        }
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, 0);
+        return status;
+    }
+
     if (strcmp(request->http_method, "GET") == 0 || strcmp(request->http_method, "HEAD") == 0) {
         char path[8192];
         char *file_data = NULL;
@@ -333,28 +419,24 @@ static int handle_request(
 
         if (resolve_path(request->http_uri, path, sizeof(path)) != 0) {
             status = 400;
-            if (send_response(client_fd, status, "text/plain", "Bad Request\n", 12, send_body, keep_alive) != 0) {
+            *keep_alive_out = false;
+            if (send_simple_error(client_fd, status) != 0) {
                 return -1;
             }
-            *bytes_out = send_body ? 12 : 0;
-            log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, *bytes_out);
+            log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, 0);
             return status;
         }
 
         file_status = load_file(path, &file_data, &file_size);
         if (file_status != 200) {
-            const char *msg = (file_status == 404) ? "Not Found\n"
-                               : (file_status == 403) ? "Forbidden\n"
-                                                      : "Internal Server Error\n";
-            size_t msg_len = strlen(msg);
-            status = file_status;
-            log_error("error", "file access failed for %s: status=%d errno=%s", path, status, strerror(errno));
-            if (send_response(client_fd, status, "text/plain", msg, msg_len, send_body, keep_alive) != 0) {
+            status = 404;
+            *keep_alive_out = false;
+            log_error("error", "file access failed for %s: errno=%s", path, strerror(errno));
+            if (send_simple_error(client_fd, status) != 0) {
                 free(file_data);
                 return -1;
             }
-            *bytes_out = send_body ? msg_len : 0;
-            log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, *bytes_out);
+            log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, 0);
             free(file_data);
             return status;
         }
@@ -379,21 +461,15 @@ static int handle_request(
 
     if (strcmp(request->http_method, "POST") == 0) {
         status = 200;
-        if (send_response(client_fd, status, "text/plain", body, body_len, true, keep_alive) != 0) {
+        if (send_all(client_fd, raw_request, raw_request_len) != 0) {
             return -1;
         }
-        *bytes_out = body_len;
+        *bytes_out = raw_request_len;
         log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, *bytes_out);
         return status;
     }
 
-    status = 501;
-    if (send_response(client_fd, status, "text/plain", "Not Implemented\n", 16, true, keep_alive) != 0) {
-        return -1;
-    }
-    *bytes_out = 16;
-    log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, *bytes_out);
-    return status;
+    return -1;
 }
 
 int main(void)
@@ -424,12 +500,17 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) != 0) {
-        log_error("error", "setsockopt failed: %s", strerror(errno));
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
+        log_error("error", "setsockopt SO_REUSEADDR failed: %s", strerror(errno));
         close_socket_if_needed(listen_sock);
         logger_close();
         return EXIT_FAILURE;
     }
+#ifdef SO_REUSEPORT
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) != 0) {
+        log_error("warn", "setsockopt SO_REUSEPORT failed: %s", strerror(errno));
+    }
+#endif
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -474,10 +555,16 @@ int main(void)
             ssize_t header_end;
             Request *request;
             int content_length = 0;
+            bool content_length_present = false;
             size_t total_needed;
             bool keep_alive = false;
             size_t bytes_sent = 0;
             int handle_status;
+
+            while (conn_len >= 2 && conn_buf[0] == '\r' && conn_buf[1] == '\n') {
+                memmove(conn_buf, conn_buf + 2, conn_len - 2);
+                conn_len -= 2;
+            }
 
             header_end = find_header_end(conn_buf, conn_len);
             while (header_end < 0) {
@@ -489,7 +576,7 @@ int main(void)
                 }
                 if (conn_len + (size_t)n > MAX_REQUEST_SIZE) {
                     log_error("error", "request too large from %s", client_ip);
-                    send_response(client_fd, 400, "text/plain", "Bad Request\n", 12, true, false);
+                    send_simple_error(client_fd, 400);
                     keep_connection = false;
                     break;
                 }
@@ -511,6 +598,12 @@ int main(void)
                 memcpy(conn_buf + conn_len, recv_buf, (size_t)n);
                 conn_len += (size_t)n;
                 header_end = find_header_end(conn_buf, conn_len);
+                if (header_end < 0 && conn_len > MAX_HEADER_SIZE) {
+                    log_error("error", "request header too large from %s", client_ip);
+                    send_simple_error(client_fd, 400);
+                    keep_connection = false;
+                    break;
+                }
             }
 
             if (!keep_connection) {
@@ -520,16 +613,19 @@ int main(void)
             request = parse(conn_buf, (int)header_end, client_fd);
             if (request == NULL) {
                 log_error("error", "parse failed from %s", client_ip);
-                send_response(client_fd, 400, "text/plain", "Bad Request\n", 12, true, false);
+                send_simple_error(client_fd, 400);
+                log_access(client_ip, NULL, NULL, NULL, 400, 0);
                 keep_connection = false;
                 break;
             }
 
             if (strcmp(request->http_method, "POST") == 0) {
+                content_length_present = request_get_header(request, "Content-Length") != NULL;
                 content_length = request_content_length(request);
                 if (content_length < 0) {
                     log_error("error", "invalid Content-Length from %s", client_ip);
-                    send_response(client_fd, 400, "text/plain", "Bad Request\n", 12, true, false);
+                    send_simple_error(client_fd, 400);
+                    log_access(client_ip, request->http_method, request->http_uri, request->http_version, 400, 0);
                     free_request(request);
                     keep_connection = false;
                     break;
@@ -546,7 +642,8 @@ int main(void)
                 }
                 if (conn_len + (size_t)n > MAX_REQUEST_SIZE) {
                     log_error("error", "request body too large from %s", client_ip);
-                    send_response(client_fd, 400, "text/plain", "Bad Request\n", 12, true, false);
+                    send_simple_error(client_fd, 400);
+                    log_access(client_ip, request->http_method, request->http_uri, request->http_version, 400, 0);
                     keep_connection = false;
                     break;
                 }
@@ -574,12 +671,19 @@ int main(void)
                 break;
             }
 
+            if (strcmp(request->http_method, "POST") == 0 &&
+                !content_length_present &&
+                conn_len > total_needed &&
+                only_crlf_bytes(conn_buf + total_needed, conn_len - total_needed)) {
+                total_needed = conn_len;
+            }
+
             handle_status = handle_request(
                 client_fd,
                 client_ip,
                 request,
-                conn_buf + (size_t)header_end,
-                (size_t)content_length,
+                conn_buf,
+                total_needed,
                 &keep_alive,
                 &bytes_sent);
 
@@ -596,7 +700,7 @@ int main(void)
             conn_len -= total_needed;
 
             free_request(request);
-            keep_connection = keep_alive;
+            keep_connection = keep_alive || conn_len > 0;
         }
 
         free(conn_buf);
