@@ -58,3 +58,14 @@
 [Mon May 04 07:06:14 2026] [error] file access failed for static_site/~prs/15-441-F15/: errno=No such file or directory
 [Mon May 04 07:06:14 2026] [error] parse failed from 172.17.0.1
 [Mon May 04 07:06:20 2026] [notice] received signal 15, shutting down
+[Mon May 04 08:52:09 2026] [notice] liso_server started on port 9999
+[Mon May 04 08:52:28 2026] [error] file access failed for static_site/.well-known/appspecific/com.chrome.devtools.json: errno=No such file or directory
+[Mon May 04 08:53:17 2026] [error] file access failed for static_site/favicon.ico: errno=No such file or directory
+[Mon May 04 09:17:46 2026] [notice] received signal 2, shutting down
+[Mon May 04 09:17:51 2026] [notice] liso_server started on port 9999
+[Mon May 04 09:18:44 2026] [error] file access failed for static_site/.well-known/appspecific/com.chrome.devtools.json: errno=No such file or directory
+[Mon May 04 09:41:07 2026] [error] file access failed for static_site/missing_file.html: errno=No such file or directory
+[Mon May 04 09:41:12 2026] [notice] received signal 2, shutting down
+[Mon May 04 09:41:16 2026] [notice] liso_server started on port 9999
+[Mon May 04 09:41:18 2026] [error] file access failed for static_site/missing_file.html: errno=No such file or directory
+[Mon May 04 09:41:21 2026] [error] file access failed for static_site/missing_file.html: errno=No such file or directory
