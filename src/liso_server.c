@@ -9,19 +9,32 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "logger.h"
 #include "parse.h"
 
 #define LISO_PORT 9999
+#define MAX_CONNECTIONS 1024
 #define RECV_CHUNK 4096
 #define MAX_HEADER_SIZE 8192
 #define MAX_REQUEST_SIZE (1024 * 1024)
+#define CGI_PREFIX "/cgi/"
+#define SERVER_SOFTWARE "Liso/1.0"
 
 static int listen_sock = -1;
+
+typedef struct {
+    int fd;
+    char ip[INET_ADDRSTRLEN];
+    char *buf;
+    size_t len;
+    size_t cap;
+} ClientState;
 
 static int close_socket_if_needed(int fd)
 {
@@ -121,6 +134,26 @@ static int send_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
+static int write_all(int fd, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(fd, p + written, len - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        written += (size_t)n;
+    }
+    return 0;
+}
+
 static int send_simple_error(int fd, int status, bool keep_alive)
 {
     char response[256];
@@ -180,6 +213,24 @@ static int send_response(
         }
     }
     return 0;
+}
+
+static char *make_env_pair(const char *name, const char *value)
+{
+    size_t name_len = strlen(name);
+    size_t value_len = value == NULL ? 0 : strlen(value);
+    char *entry = (char *)malloc(name_len + value_len + 2);
+
+    if (entry == NULL) {
+        return NULL;
+    }
+    memcpy(entry, name, name_len);
+    entry[name_len] = '=';
+    if (value_len > 0) {
+        memcpy(entry + name_len + 1, value, value_len);
+    }
+    entry[name_len + value_len + 1] = '\0';
+    return entry;
 }
 
 static ssize_t find_header_end(const char *buf, size_t len)
@@ -326,6 +377,90 @@ static int request_content_length(const Request *req)
     return (int)value;
 }
 
+static bool is_cgi_request_uri(const char *uri)
+{
+    return uri != NULL && strncmp(uri, CGI_PREFIX, strlen(CGI_PREFIX)) == 0;
+}
+
+static int split_uri_query(const char *uri, char *path, size_t path_size, char *query, size_t query_size)
+{
+    const char *qmark;
+    size_t path_len;
+
+    if (uri == NULL || uri[0] != '/' || strstr(uri, "..") != NULL) {
+        return -1;
+    }
+
+    qmark = strchr(uri, '?');
+    path_len = qmark == NULL ? strlen(uri) : (size_t)(qmark - uri);
+    if (path_len == 0 || path_len >= path_size) {
+        return -1;
+    }
+
+    memcpy(path, uri, path_len);
+    path[path_len] = '\0';
+
+    if (query_size > 0) {
+        if (qmark == NULL) {
+            query[0] = '\0';
+        } else if (strlen(qmark + 1) >= query_size) {
+            return -1;
+        } else {
+            strcpy(query, qmark + 1);
+        }
+    }
+    return 0;
+}
+
+static int resolve_cgi_path(
+    const char *uri,
+    char *script_name,
+    size_t script_name_size,
+    char *script_path,
+    size_t script_path_size,
+    char *path_info,
+    size_t path_info_size,
+    char *query_string,
+    size_t query_string_size
+)
+{
+    char clean_path[4096];
+    const char *script_start;
+    const char *slash_after_script;
+    size_t script_len;
+
+    if (split_uri_query(uri, clean_path, sizeof(clean_path), query_string, query_string_size) != 0 ||
+        !is_cgi_request_uri(clean_path)) {
+        return -1;
+    }
+
+    script_start = clean_path + strlen(CGI_PREFIX);
+    if (*script_start == '\0') {
+        return -1;
+    }
+
+    slash_after_script = strchr(script_start, '/');
+    script_len = slash_after_script == NULL ? strlen(script_start) : (size_t)(slash_after_script - script_start);
+    if (script_len == 0 || script_len >= 256) {
+        return -1;
+    }
+
+    if (snprintf(script_name, script_name_size, "%s%.*s", CGI_PREFIX, (int)script_len, script_start) >= (int)script_name_size ||
+        snprintf(script_path, script_path_size, "cgi/%.*s", (int)script_len, script_start) >= (int)script_path_size) {
+        return -1;
+    }
+
+    if (slash_after_script == NULL) {
+        path_info[0] = '\0';
+    } else if (strlen(slash_after_script) >= path_info_size) {
+        return -1;
+    } else {
+        strcpy(path_info, slash_after_script);
+    }
+
+    return 0;
+}
+
 static int resolve_path(const char *uri, char *out, size_t out_size)
 {
     const char *mapped_uri = uri;
@@ -439,6 +574,472 @@ static int handle_request(
     size_t raw_request_len,
     bool *keep_alive_out,
     size_t *bytes_out
+);
+
+static void init_client(ClientState *client)
+{
+    client->fd = -1;
+    client->ip[0] = '\0';
+    client->buf = NULL;
+    client->len = 0;
+    client->cap = 0;
+}
+
+static void close_client(ClientState *client)
+{
+    if (client->fd >= 0) {
+        close_socket_if_needed(client->fd);
+    }
+    free(client->buf);
+    init_client(client);
+}
+
+static int ensure_client_capacity(ClientState *client, size_t additional)
+{
+    size_t needed = client->len + additional;
+
+    if (needed > MAX_REQUEST_SIZE) {
+        return -1;
+    }
+    if (needed <= client->cap) {
+        return 0;
+    }
+
+    size_t new_cap = client->cap == 0 ? 8192 : client->cap * 2;
+    char *new_buf;
+    while (new_cap < needed) {
+        new_cap *= 2;
+    }
+
+    new_buf = realloc(client->buf, new_cap);
+    if (new_buf == NULL) {
+        return -1;
+    }
+    client->buf = new_buf;
+    client->cap = new_cap;
+    return 0;
+}
+
+static int append_client_data(ClientState *client, const char *data, size_t len)
+{
+    if (ensure_client_capacity(client, len) != 0) {
+        return -1;
+    }
+    memcpy(client->buf + client->len, data, len);
+    client->len += len;
+    return 0;
+}
+
+static bool process_client_buffer(ClientState *client)
+{
+    while (1) {
+        ssize_t header_end;
+        Request *request;
+        int content_length = 0;
+        bool content_length_present = false;
+        size_t total_needed;
+        bool keep_alive = false;
+        size_t bytes_sent = 0;
+        int handle_status;
+
+        while (client->len >= 2 && client->buf[0] == '\r' && client->buf[1] == '\n') {
+            memmove(client->buf, client->buf + 2, client->len - 2);
+            client->len -= 2;
+        }
+
+        header_end = find_header_end(client->buf, client->len);
+        if (header_end < 0) {
+            if (client->len > MAX_HEADER_SIZE) {
+                log_error("error", "request header too large from %s", client->ip);
+                send_simple_error(client->fd, 400, false);
+                log_access(client->ip, NULL, NULL, NULL, 400, 0);
+                return false;
+            }
+            return true;
+        }
+
+        request = parse(client->buf, (int)header_end, client->fd);
+        if (request == NULL) {
+            bool can_continue = false;
+            ssize_t next_start = find_next_request_start(client->buf, client->len, (size_t)header_end);
+
+            log_error("error", "parse failed from %s", client->ip);
+            if (next_start >= 0) {
+                can_continue = true;
+                discard_buffer_prefix(client->buf, &client->len, (size_t)next_start);
+            } else {
+                discard_buffer_prefix(client->buf, &client->len, client->len);
+            }
+            send_simple_error(client->fd, 400, can_continue);
+            log_access(client->ip, NULL, NULL, NULL, 400, 0);
+            if (!can_continue) {
+                return false;
+            }
+            continue;
+        }
+
+        content_length_present = request_get_header(request, "Content-Length") != NULL;
+        content_length = request_content_length(request);
+        if (content_length < 0) {
+            bool can_continue = false;
+            ssize_t next_start = find_next_request_start(client->buf, client->len, (size_t)header_end);
+
+            log_error("error", "invalid Content-Length from %s", client->ip);
+            if (next_start >= 0) {
+                discard_buffer_prefix(client->buf, &client->len, (size_t)next_start);
+                can_continue = true;
+            } else {
+                discard_buffer_prefix(client->buf, &client->len, client->len);
+            }
+            send_simple_error(client->fd, 400, can_continue);
+            log_access(client->ip, request->http_method, request->http_uri, request->http_version, 400, 0);
+            free_request(request);
+            if (!can_continue) {
+                return false;
+            }
+            continue;
+        }
+
+        total_needed = (size_t)header_end + (size_t)content_length;
+        if (total_needed > MAX_REQUEST_SIZE) {
+            log_error("error", "request too large from %s", client->ip);
+            send_simple_error(client->fd, 400, false);
+            log_access(client->ip, request->http_method, request->http_uri, request->http_version, 400, 0);
+            free_request(request);
+            return false;
+        }
+        if (client->len < total_needed) {
+            free_request(request);
+            return true;
+        }
+
+        if (strcmp(request->http_method, "POST") == 0 &&
+            !content_length_present &&
+            client->len > total_needed &&
+            only_crlf_bytes(client->buf + total_needed, client->len - total_needed)) {
+            total_needed = client->len;
+        }
+
+        handle_status = handle_request(
+            client->fd,
+            client->ip,
+            request,
+            client->buf,
+            total_needed,
+            &keep_alive,
+            &bytes_sent);
+
+        if (handle_status < 0) {
+            log_error("error", "send failed to %s: %s", client->ip, strerror(errno));
+            free_request(request);
+            return false;
+        }
+
+        discard_buffer_prefix(client->buf, &client->len, total_needed);
+        free_request(request);
+
+        if (!keep_alive && client->len == 0) {
+            return false;
+        }
+        if (client->len == 0) {
+            return true;
+        }
+    }
+}
+
+static void free_env(char **envp, size_t env_count)
+{
+    size_t i;
+    if (envp == NULL) {
+        return;
+    }
+    for (i = 0; i < env_count; i++) {
+        free(envp[i]);
+    }
+    free(envp);
+}
+
+static int add_env(char **envp, size_t env_cap, size_t *env_count, const char *name, const char *value)
+{
+    if (*env_count + 1 >= env_cap) {
+        return -1;
+    }
+    envp[*env_count] = make_env_pair(name, value);
+    if (envp[*env_count] == NULL) {
+        return -1;
+    }
+    (*env_count)++;
+    envp[*env_count] = NULL;
+    return 0;
+}
+
+static int add_header_env(
+    char **envp,
+    size_t env_cap,
+    size_t *env_count,
+    const Request *request,
+    const char *env_name,
+    const char *header_name
+)
+{
+    return add_env(envp, env_cap, env_count, env_name, request_get_header(request, header_name));
+}
+
+static char **build_cgi_env(
+    const Request *request,
+    const char *client_ip,
+    const char *script_name,
+    const char *path_info,
+    const char *query_string,
+    size_t *env_count_out
+)
+{
+    char **envp;
+    size_t env_count = 0;
+    const size_t env_cap = 32;
+    char server_port[16];
+
+    envp = (char **)calloc(env_cap, sizeof(char *));
+    if (envp == NULL) {
+        return NULL;
+    }
+
+    snprintf(server_port, sizeof(server_port), "%d", LISO_PORT);
+
+    if (add_header_env(envp, env_cap, &env_count, request, "CONTENT_LENGTH", "Content-Length") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "CONTENT_TYPE", "Content-Type") != 0 ||
+        add_env(envp, env_cap, &env_count, "GATEWAY_INTERFACE", "CGI/1.1") != 0 ||
+        add_env(envp, env_cap, &env_count, "PATH_INFO", path_info) != 0 ||
+        add_env(envp, env_cap, &env_count, "QUERY_STRING", query_string) != 0 ||
+        add_env(envp, env_cap, &env_count, "REMOTE_ADDR", client_ip) != 0 ||
+        add_env(envp, env_cap, &env_count, "REQUEST_METHOD", request->http_method) != 0 ||
+        add_env(envp, env_cap, &env_count, "REQUEST_URI", request->http_uri) != 0 ||
+        add_env(envp, env_cap, &env_count, "SCRIPT_NAME", script_name) != 0 ||
+        add_env(envp, env_cap, &env_count, "SERVER_PORT", server_port) != 0 ||
+        add_env(envp, env_cap, &env_count, "SERVER_PROTOCOL", "HTTP/1.1") != 0 ||
+        add_env(envp, env_cap, &env_count, "SERVER_SOFTWARE", SERVER_SOFTWARE) != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_ACCEPT", "Accept") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_REFERER", "Referer") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_ACCEPT_ENCODING", "Accept-Encoding") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_ACCEPT_LANGUAGE", "Accept-Language") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_ACCEPT_CHARSET", "Accept-Charset") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_HOST", "Host") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_COOKIE", "Cookie") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_USER_AGENT", "User-Agent") != 0 ||
+        add_header_env(envp, env_cap, &env_count, request, "HTTP_CONNECTION", "Connection") != 0) {
+        free_env(envp, env_count);
+        return NULL;
+    }
+
+    *env_count_out = env_count;
+    return envp;
+}
+
+static int append_output(char **buf, size_t *len, size_t *cap, const char *data, size_t data_len)
+{
+    size_t needed = *len + data_len;
+    char *new_buf;
+    size_t new_cap;
+
+    if (needed > MAX_REQUEST_SIZE) {
+        return -1;
+    }
+    if (needed <= *cap) {
+        memcpy(*buf + *len, data, data_len);
+        *len = needed;
+        return 0;
+    }
+
+    new_cap = *cap == 0 ? 8192 : *cap * 2;
+    while (new_cap < needed) {
+        new_cap *= 2;
+    }
+
+    new_buf = (char *)realloc(*buf, new_cap);
+    if (new_buf == NULL) {
+        return -1;
+    }
+    *buf = new_buf;
+    *cap = new_cap;
+    memcpy(*buf + *len, data, data_len);
+    *len = needed;
+    return 0;
+}
+
+static int send_cgi_output(int client_fd, const char *output, size_t output_len)
+{
+    const char *prefix = "HTTP/1.1 200 OK\r\nConnection: close\r\n";
+
+    if (output_len >= 5 && memcmp(output, "HTTP/", 5) == 0) {
+        return send_all(client_fd, output, output_len);
+    }
+    if (send_all(client_fd, prefix, strlen(prefix)) != 0) {
+        return -1;
+    }
+    return send_all(client_fd, output, output_len);
+}
+
+static int run_cgi(
+    int client_fd,
+    const char *client_ip,
+    const Request *request,
+    const char *body,
+    size_t body_len,
+    bool *keep_alive_out,
+    size_t *bytes_out
+)
+{
+    char script_name[512];
+    char script_path[1024];
+    char path_info[4096];
+    char query_string[4096];
+    char *argv[2];
+    char **envp = NULL;
+    size_t env_count = 0;
+    int stdin_pipe[2] = {-1, -1};
+    int stdout_pipe[2] = {-1, -1};
+    pid_t pid;
+    int status;
+    char *cgi_output = NULL;
+    size_t output_len = 0;
+    size_t output_cap = 0;
+    int result = -1;
+
+    *keep_alive_out = false;
+    *bytes_out = 0;
+
+    if (resolve_cgi_path(
+            request->http_uri,
+            script_name,
+            sizeof(script_name),
+            script_path,
+            sizeof(script_path),
+            path_info,
+            sizeof(path_info),
+            query_string,
+            sizeof(query_string)) != 0) {
+        send_simple_error(client_fd, 404, false);
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, 404, 0);
+        return 404;
+    }
+
+    if (access(script_path, X_OK) != 0) {
+        send_simple_error(client_fd, 404, false);
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, 404, 0);
+        return 404;
+    }
+
+    envp = build_cgi_env(request, client_ip, script_name, path_info, query_string, &env_count);
+    if (envp == NULL || pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0) {
+        send_simple_error(client_fd, 500, false);
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, 500, 0);
+        goto cleanup;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        send_simple_error(client_fd, 500, false);
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, 500, 0);
+        goto cleanup;
+    }
+
+    if (pid == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+
+        argv[0] = script_path;
+        argv[1] = NULL;
+        execve(script_path, argv, envp);
+        _exit(127);
+    }
+
+    close(stdin_pipe[0]);
+    stdin_pipe[0] = -1;
+    close(stdout_pipe[1]);
+    stdout_pipe[1] = -1;
+
+    if (body_len > 0 && write_all(stdin_pipe[1], body, body_len) != 0) {
+        close(stdin_pipe[1]);
+        stdin_pipe[1] = -1;
+        waitpid(pid, &status, 0);
+        send_simple_error(client_fd, 500, false);
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, 500, 0);
+        goto cleanup;
+    }
+    close(stdin_pipe[1]);
+    stdin_pipe[1] = -1;
+
+    while (1) {
+        char buf[RECV_CHUNK];
+        ssize_t n = read(stdout_pipe[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            waitpid(pid, &status, 0);
+            send_simple_error(client_fd, 500, false);
+            log_access(client_ip, request->http_method, request->http_uri, request->http_version, 500, 0);
+            goto cleanup;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (append_output(&cgi_output, &output_len, &output_cap, buf, (size_t)n) != 0) {
+            waitpid(pid, &status, 0);
+            send_simple_error(client_fd, 500, false);
+            log_access(client_ip, request->http_method, request->http_uri, request->http_version, 500, 0);
+            goto cleanup;
+        }
+    }
+
+    close(stdout_pipe[0]);
+    stdout_pipe[0] = -1;
+
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        send_simple_error(client_fd, 500, false);
+        log_access(client_ip, request->http_method, request->http_uri, request->http_version, 500, 0);
+        goto cleanup;
+    }
+
+    if (send_cgi_output(client_fd, cgi_output == NULL ? "" : cgi_output, output_len) != 0) {
+        goto cleanup;
+    }
+
+    *bytes_out = output_len;
+    log_access(client_ip, request->http_method, request->http_uri, request->http_version, 200, *bytes_out);
+    result = 200;
+
+cleanup:
+    if (stdin_pipe[0] >= 0) {
+        close(stdin_pipe[0]);
+    }
+    if (stdin_pipe[1] >= 0) {
+        close(stdin_pipe[1]);
+    }
+    if (stdout_pipe[0] >= 0) {
+        close(stdout_pipe[0]);
+    }
+    if (stdout_pipe[1] >= 0) {
+        close(stdout_pipe[1]);
+    }
+    free(cgi_output);
+    free_env(envp, env_count);
+    return result;
+}
+
+static int handle_request(
+    int client_fd,
+    const char *client_ip,
+    const Request *request,
+    const char *raw_request,
+    size_t raw_request_len,
+    bool *keep_alive_out,
+    size_t *bytes_out
 )
 {
     int status = 500;
@@ -465,6 +1066,18 @@ static int handle_request(
         }
         log_access(client_ip, request->http_method, request->http_uri, request->http_version, status, 0);
         return status;
+    }
+
+    if (is_cgi_request_uri(request->http_uri)) {
+        ssize_t header_end = find_header_end(raw_request, raw_request_len);
+        const char *body = "";
+        size_t body_len = 0;
+
+        if (header_end >= 0 && raw_request_len > (size_t)header_end) {
+            body = raw_request + header_end;
+            body_len = raw_request_len - (size_t)header_end;
+        }
+        return run_cgi(client_fd, client_ip, request, body, body_len, keep_alive_out, bytes_out);
     }
 
     if (strcmp(request->http_method, "GET") == 0 || strcmp(request->http_method, "HEAD") == 0) {
@@ -540,6 +1153,8 @@ int main(void)
 {
     struct sockaddr_in addr;
     int opt = 1;
+    ClientState clients[MAX_CONNECTIONS];
+    int i;
 
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
@@ -588,208 +1203,104 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    if (listen(listen_sock, 8) != 0) {
+    if (listen(listen_sock, MAX_CONNECTIONS) != 0) {
         log_error("error", "listen failed: %s", strerror(errno));
         close_socket_if_needed(listen_sock);
         logger_close();
         return EXIT_FAILURE;
     }
 
+    for (i = 0; i < MAX_CONNECTIONS; i++) {
+        init_client(&clients[i]);
+    }
+
     log_error("notice", "liso_server started on port %d", LISO_PORT);
 
     while (1) {
-        int client_fd;
-        struct sockaddr_in cli_addr;
-        socklen_t cli_size = sizeof(cli_addr);
-        char client_ip[INET_ADDRSTRLEN] = "-";
-        char *conn_buf = NULL;
-        size_t conn_len = 0;
-        size_t conn_cap = 0;
-        bool keep_connection = true;
+        fd_set readfds;
+        int max_fd = listen_sock;
+        int ready;
 
-        client_fd = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_size);
-        if (client_fd < 0) {
-            log_error("error", "accept failed: %s", strerror(errno));
+        FD_ZERO(&readfds);
+        FD_SET(listen_sock, &readfds);
+        for (i = 0; i < MAX_CONNECTIONS; i++) {
+            if (clients[i].fd >= 0) {
+                FD_SET(clients[i].fd, &readfds);
+                if (clients[i].fd > max_fd) {
+                    max_fd = clients[i].fd;
+                }
+            }
+        }
+
+        ready = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            log_error("error", "select failed: %s", strerror(errno));
             continue;
         }
 
-        inet_ntop(AF_INET, &cli_addr.sin_addr, client_ip, sizeof(client_ip));
+        if (FD_ISSET(listen_sock, &readfds)) {
+            int client_fd;
+            int slot = -1;
+            struct sockaddr_in cli_addr;
+            socklen_t cli_size = sizeof(cli_addr);
 
-        while (keep_connection) {
-            ssize_t header_end;
-            Request *request;
-            int content_length = 0;
-            bool content_length_present = false;
-            size_t total_needed;
-            bool keep_alive = false;
-            size_t bytes_sent = 0;
-            int handle_status;
-
-            while (conn_len >= 2 && conn_buf[0] == '\r' && conn_buf[1] == '\n') {
-                memmove(conn_buf, conn_buf + 2, conn_len - 2);
-                conn_len -= 2;
-            }
-
-            header_end = find_header_end(conn_buf, conn_len);
-            while (header_end < 0) {
-                char recv_buf[RECV_CHUNK];
-                ssize_t n = recv(client_fd, recv_buf, sizeof(recv_buf), 0);
-                if (n <= 0) {
-                    keep_connection = false;
-                    break;
-                }
-                if (conn_len + (size_t)n > MAX_REQUEST_SIZE) {
-                    log_error("error", "request too large from %s", client_ip);
-                    send_simple_error(client_fd, 400, false);
-                    keep_connection = false;
-                    break;
-                }
-                if (conn_len + (size_t)n > conn_cap) {
-                    size_t new_cap = conn_cap == 0 ? 8192 : conn_cap * 2;
-                    char *new_buf;
-                    while (new_cap < conn_len + (size_t)n) {
-                        new_cap *= 2;
-                    }
-                    new_buf = realloc(conn_buf, new_cap);
-                    if (new_buf == NULL) {
-                        log_error("error", "memory allocation failed while reading request");
-                        keep_connection = false;
-                        break;
-                    }
-                    conn_buf = new_buf;
-                    conn_cap = new_cap;
-                }
-                memcpy(conn_buf + conn_len, recv_buf, (size_t)n);
-                conn_len += (size_t)n;
-                header_end = find_header_end(conn_buf, conn_len);
-                if (header_end < 0 && conn_len > MAX_HEADER_SIZE) {
-                    log_error("error", "request header too large from %s", client_ip);
-                    send_simple_error(client_fd, 400, false);
-                    keep_connection = false;
+            for (i = 0; i < MAX_CONNECTIONS; i++) {
+                if (clients[i].fd < 0) {
+                    slot = i;
                     break;
                 }
             }
 
-            if (!keep_connection) {
-                break;
-            }
-
-            request = parse(conn_buf, (int)header_end, client_fd);
-            if (request == NULL) {
-                bool can_continue = false;
-                ssize_t next_start = find_next_request_start(conn_buf, conn_len, (size_t)header_end);
-
-                log_error("error", "parse failed from %s", client_ip);
-                if (next_start >= 0) {
-                    can_continue = true;
-                    discard_buffer_prefix(conn_buf, &conn_len, (size_t)next_start);
-                } else {
-                    discard_buffer_prefix(conn_buf, &conn_len, conn_len);
+            client_fd = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_size);
+            if (client_fd < 0) {
+                log_error("error", "accept failed: %s", strerror(errno));
+            } else if (slot < 0 || client_fd >= FD_SETSIZE) {
+                log_error("warn", "too many clients, rejecting fd %d", client_fd);
+                close_socket_if_needed(client_fd);
+            } else {
+                clients[slot].fd = client_fd;
+                if (inet_ntop(AF_INET, &cli_addr.sin_addr, clients[slot].ip, sizeof(clients[slot].ip)) == NULL) {
+                    strcpy(clients[slot].ip, "-");
                 }
-                send_simple_error(client_fd, 400, can_continue);
-                log_access(client_ip, NULL, NULL, NULL, 400, 0);
-                keep_connection = can_continue;
-                continue;
+                log_error("notice", "accepted connection from %s on fd %d", clients[slot].ip, client_fd);
             }
-
-            content_length_present = request_get_header(request, "Content-Length") != NULL;
-            content_length = request_content_length(request);
-            if (content_length < 0) {
-                bool can_continue = false;
-                ssize_t next_start = find_next_request_start(conn_buf, conn_len, (size_t)header_end);
-
-                log_error("error", "invalid Content-Length from %s", client_ip);
-                if (next_start >= 0) {
-                    discard_buffer_prefix(conn_buf, &conn_len, (size_t)next_start);
-                    can_continue = true;
-                } else {
-                    discard_buffer_prefix(conn_buf, &conn_len, conn_len);
-                }
-                send_simple_error(client_fd, 400, can_continue);
-                log_access(client_ip, request->http_method, request->http_uri, request->http_version, 400, 0);
-                free_request(request);
-                keep_connection = can_continue;
-                continue;
-            }
-
-            total_needed = (size_t)header_end + (size_t)content_length;
-            if (total_needed > MAX_REQUEST_SIZE) {
-                log_error("error", "request too large from %s", client_ip);
-                send_simple_error(client_fd, 400, false);
-                log_access(client_ip, request->http_method, request->http_uri, request->http_version, 400, 0);
-                free_request(request);
-                keep_connection = false;
-                break;
-            }
-            while (conn_len < total_needed) {
-                char recv_buf[RECV_CHUNK];
-                ssize_t n = recv(client_fd, recv_buf, sizeof(recv_buf), 0);
-                if (n <= 0) {
-                    keep_connection = false;
-                    break;
-                }
-                if (conn_len + (size_t)n > MAX_REQUEST_SIZE) {
-                    log_error("error", "request body too large from %s", client_ip);
-                    send_simple_error(client_fd, 400, false);
-                    log_access(client_ip, request->http_method, request->http_uri, request->http_version, 400, 0);
-                    keep_connection = false;
-                    break;
-                }
-                if (conn_len + (size_t)n > conn_cap) {
-                    size_t new_cap = conn_cap == 0 ? 8192 : conn_cap * 2;
-                    char *new_buf;
-                    while (new_cap < conn_len + (size_t)n) {
-                        new_cap *= 2;
-                    }
-                    new_buf = realloc(conn_buf, new_cap);
-                    if (new_buf == NULL) {
-                        log_error("error", "memory allocation failed while reading body");
-                        keep_connection = false;
-                        break;
-                    }
-                    conn_buf = new_buf;
-                    conn_cap = new_cap;
-                }
-                memcpy(conn_buf + conn_len, recv_buf, (size_t)n);
-                conn_len += (size_t)n;
-            }
-
-            if (!keep_connection) {
-                free_request(request);
-                break;
-            }
-
-            if (strcmp(request->http_method, "POST") == 0 &&
-                !content_length_present &&
-                conn_len > total_needed &&
-                only_crlf_bytes(conn_buf + total_needed, conn_len - total_needed)) {
-                total_needed = conn_len;
-            }
-
-            handle_status = handle_request(
-                client_fd,
-                client_ip,
-                request,
-                conn_buf,
-                total_needed,
-                &keep_alive,
-                &bytes_sent);
-
-            if (handle_status < 0) {
-                log_error("error", "send failed to %s: %s", client_ip, strerror(errno));
-                keep_connection = false;
-                free_request(request);
-                break;
-            }
-
-            discard_buffer_prefix(conn_buf, &conn_len, total_needed);
-
-            free_request(request);
-            keep_connection = keep_alive || conn_len > 0;
         }
 
-        free(conn_buf);
-        close_socket_if_needed(client_fd);
+        for (i = 0; i < MAX_CONNECTIONS; i++) {
+            char recv_buf[RECV_CHUNK];
+            ssize_t n;
+
+            if (clients[i].fd < 0 || !FD_ISSET(clients[i].fd, &readfds)) {
+                continue;
+            }
+
+            n = recv(clients[i].fd, recv_buf, sizeof(recv_buf), 0);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (n < 0) {
+                    log_error("error", "recv failed from %s: %s", clients[i].ip, strerror(errno));
+                }
+                close_client(&clients[i]);
+                continue;
+            }
+
+            if (append_client_data(&clients[i], recv_buf, (size_t)n) != 0) {
+                log_error("error", "request too large or memory allocation failed from %s", clients[i].ip);
+                send_simple_error(clients[i].fd, 400, false);
+                log_access(clients[i].ip, NULL, NULL, NULL, 400, 0);
+                close_client(&clients[i]);
+                continue;
+            }
+
+            if (!process_client_buffer(&clients[i])) {
+                close_client(&clients[i]);
+            }
+        }
     }
 
     close_socket_if_needed(listen_sock);

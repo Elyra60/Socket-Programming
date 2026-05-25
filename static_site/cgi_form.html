@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <title>Liso CGI Form</title>
+        <link rel="stylesheet" type="text/css" href="style.css">
+    </head>
+    <body>
+        <div id="page">
+            <h1>CGI Form Test</h1>
+            <form action="/cgi/form.cgi" method="post">
+                <p>
+                    <label>Username<br>
+                        <input name="username" type="text" value="alice">
+                    </label>
+                </p>
+                <p>
+                    <label>Password<br>
+                        <input name="password" type="password" value="secret">
+                    </label>
+                </p>
+                <p><button type="submit">Submit with POST</button></p>
+            </form>
+            <p>
+                <a href="/cgi/form.cgi?username=bob&amp;password=from-get">Submit sample GET request</a>
+            </p>
+            <p>
+                <a href="/cgi/fail.cgi">Trigger CGI failure</a>
+            </p>
+        </div>
+    </body>
+</html>
